@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Optional, Dict
 
 from sqlalchemy import text
+from sqlalchemy.orm.attributes import flag_modified
 
 from amocrm import Customer, Lead
 from models import AbstractCustomer, db, AbcCustomerEntities
@@ -107,16 +108,15 @@ def create_or_update_customer(abstract_customer: Optional[AbstractCustomer], amo
         abstract_customer.amo_customers = [get_customer_json(amo_customer)]
         return abstract_customer
 
-    index = [idx for idx, c in enumerate(abstract_customer.amo_customers) if c['general']['id'] == amo_customer.id]
-    if not index:
-        index = len(abstract_customer.amo_customers)
+    customer_data = get_customer_json(amo_customer)
+    index = next((idx for idx, item in enumerate(abc_amo_customers)
+                  if item['general']['id'] == amo_customer.id), None)
+    if index is None:
+        abc_amo_customers.append(customer_data)
     else:
-        index = index[0]
-
-    update_jsonb_field(entity_id=abstract_customer.id,
-                       attribute=AbcCustomerEntities.AmoCustomer,
-                       index=index,
-                       new_value=get_customer_json(amo_customer))
+        abc_amo_customers[index] = customer_data
+    abstract_customer.amo_customers = abc_amo_customers
+    flag_modified(abstract_customer, 'amo_customers')
     return abstract_customer
 
 
@@ -132,14 +132,12 @@ def create_or_update_lead(abc_customer: Optional[AbstractCustomer], amo_lead: Le
         abc_customer.amo_leads = [get_lead_json(amo_lead)]
         return abc_customer
 
-    index = [idx for idx, c in enumerate(abc_customer.amo_leads) if c['general']['id'] == amo_lead.id]
-    if not index:
-        index = len(abc_customer.amo_leads)
+    lead_data = get_lead_json(amo_lead)
+    index = next((idx for idx, item in enumerate(abc_customer.amo_leads)
+                  if item['general']['id'] == amo_lead.id), None)
+    if index is None:
+        abc_customer.amo_leads.append(lead_data)
     else:
-        index = index[0]
-
-    update_jsonb_field(entity_id=abc_customer.id,
-                       attribute=AbcCustomerEntities.AmoLead,
-                       index=index,
-                       new_value=get_lead_json(amo_lead))
+        abc_customer.amo_leads[index] = lead_data
+    flag_modified(abc_customer, 'amo_leads')
     return abc_customer
