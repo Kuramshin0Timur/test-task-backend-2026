@@ -109,7 +109,7 @@ def create_or_update_customer(abstract_customer: Optional[AbstractCustomer], amo
 
     index = [idx for idx, c in enumerate(abstract_customer.amo_customers) if c['general']['id'] == amo_customer.id]
     if not index:
-        index = len(abstract_customer.amo_customers) + 1
+        index = len(abstract_customer.amo_customers)
     else:
         index = index[0]
 
@@ -125,17 +125,16 @@ def create_or_update_lead(abc_customer: Optional[AbstractCustomer], amo_lead: Le
         new_abstract_customer = AbstractCustomer(
             amo_leads=[get_lead_json(amo_lead)])
         db.session.add(new_abstract_customer)
-        db.session.commit()
+        db.session.flush()
         return new_abstract_customer
 
     if not abc_customer.amo_leads:
         abc_customer.amo_leads = [get_lead_json(amo_lead)]
-        db.session.commit()
         return abc_customer
 
     index = [idx for idx, c in enumerate(abc_customer.amo_leads) if c['general']['id'] == amo_lead.id]
     if not index:
-        index = len(abc_customer.amo_leads) + 1
+        index = len(abc_customer.amo_leads)
     else:
         index = index[0]
 
@@ -143,5 +142,4 @@ def create_or_update_lead(abc_customer: Optional[AbstractCustomer], amo_lead: Le
                        attribute=AbcCustomerEntities.AmoLead,
                        index=index,
                        new_value=get_lead_json(amo_lead))
-    db.session.commit()
     return abc_customer
