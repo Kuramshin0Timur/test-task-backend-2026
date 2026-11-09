@@ -1,232 +1,316 @@
 import logging
-from typing import Iterator, List, Dict
+from typing import Dict, Iterator, List
 
 from sqlalchemy.orm.attributes import flag_modified
 
-from abstract_customer import create_or_update_customer, dict_compare_merge, create_or_update_lead
-from amocrm import Customer, COMPANIES, CONTACTS, Lead, amocrm_get
-from models import db, AbstractCustomer
+from abstract_customer import create_or_update_customer, create_or_update_lead, dict_compare_merge
+from amocrm import COMPANIES, CONTACTS, Customer, Lead, amocrm_get
+from models import AbstractCustomer, db
 
 logger = logging.getLogger(__name__)
 
 
 class AbstractCustomerIndex:
-    def __init__(self, customers):
-        self.customers = customers
+    def __init__(self, customers: List[AbstractCustomer]):
+        self.customers = list(customers)
         self.customer_ids = {}
         self.lead_ids = {}
         self.customer_logins = {}
         self.lead_logins = {}
         self.deleted_ids = set()
-        self.customer_object_ids = {customer.id for customer in customers}
-        for customer in customers:
+        self._customer_objects = {id(customer) for customer in self.customers}
+
+        for customer in self.customers:
             self.add_customer(customer)
             self.add_leads(customer)
 
     @staticmethod
     def _add(mapping, key, customer):
-        if key is None:
+        if not key:
             return
         values = mapping.setdefault(key, [])
-        if all(item.id != customer.id for item in values):
+        if all(item is not customer for item in values):
             values.append(customer)
 
+    @staticmethod
+    def _remove(mapping, key, customer):
+        if not key:
+            return
+        values = mapping.get(key)
+        if not values:
+            return
+        values = [item for item in values if item is not customer]
+        if values:
+            mapping[key] = values
+        else:
+            mapping.pop(key, None)
+
     def _remember(self, customer):
-        if customer.id not in self.customer_object_ids:
+        object_id = id(customer)
+        if object_id not in self._customer_objects:
             self.customers.append(customer)
-            self.customer_object_ids.add(customer.id)
+            self._customer_objects.add(object_id)
 
     def add_customer(self, customer, amo_customer=None):
         self._remember(customer)
         if amo_customer is None:
             for item in customer.amo_customers or []:
-                self.customer_ids[item['general']['id']] = customer
-                self._add(self.customer_logins, item['general'].get('login'), customer)
-        else:
-            self.customer_ids[amo_customer.id] = customer
-            self._add(self.customer_logins, amo_customer.get_field('Логин'), customer)
+                general = item.get('general') or {}
+                customer_id = general.get('id')
+                if customer_id is not None:
+                    self.customer_ids[customer_id] = customer
+                self._add(self.customer_logins, general.get('login'), customer)
+            return
+
+        self.customer_ids[amo_customer.id] = customer
+        self._add(self.customer_logins, amo_customer.get_field('Логин'), customer)
 
     def add_leads(self, customer, amo_lead=None):
         self._remember(customer)
         if amo_lead is None:
             for item in customer.amo_leads or []:
-                self.lead_ids[item['general']['id']] = customer
-                self._add(self.lead_logins, item['general'].get('login'), customer)
-        else:
-            self.lead_ids[amo_lead.id] = customer
-            self._add(self.lead_logins, amo_lead.get_field('Логин'), customer)
+                general = item.get('general') or {}
+                lead_id = general.get('id')
+                if lead_id is not None:
+                    self.lead_ids[lead_id] = customer
+                self._add(self.lead_logins, general.get('login'), customer)
+            return
+
+        self.lead_ids[amo_lead.id] = customer
+        self._add(self.lead_logins, amo_lead.get_field('Логин'), customer)
+
+    def remove_customer(self, customer_id):
+        customer = self.customer_ids.pop(customer_id, None)
+        if customer is None:
+            return
+
+        for item in customer.amo_customers or []:
+            general = item.get('general') or {}
+            if general.get('id') != customer_id:
+                continue
+            login = general.get('login')
+            if not any((entry.get('general') or {}).get('login') == login
+                       for entry in customer.amo_customers or []
+                       if (entry.get('general') or {}).get('id') != customer_id):
+                self._remove(self.customer_logins, login, customer)
+            break
+
+    def remove_lead(self, lead_id):
+        customer = self.lead_ids.pop(lead_id, None)
+        if customer is None:
+            return
+
+        for item in customer.amo_leads or []:
+            general = item.get('general') or {}
+            if general.get('id') != lead_id:
+                continue
+            login = general.get('login')
+            if not any((entry.get('general') or {}).get('login') == login
+                       for entry in customer.amo_leads or []
+                       if (entry.get('general') or {}).get('id') != lead_id):
+                self._remove(self.lead_logins, login, customer)
+            break
 
     @staticmethod
     def _unique(mapping, login):
+        if not login:
+            return None
         values = mapping.get(login, [])
         return values[0] if len(values) == 1 else None
 
     def replace(self, old, new):
         for mapping in (self.customer_ids, self.lead_ids):
             for key, value in list(mapping.items()):
-                if value.id == old.id:
+                if value is old:
                     mapping[key] = new
+
         for mapping in (self.customer_logins, self.lead_logins):
             for key, values in list(mapping.items()):
-                mapping[key] = [new if item.id == old.id else item for item in values]
-                mapping[key] = list({item.id: item for item in mapping[key]}.values())
-        self.deleted_ids.add(old.id)
+                replaced = [new if item is old else item for item in values]
+                unique = []
+                for item in replaced:
+                    if all(existing is not item for existing in unique):
+                        unique.append(item)
+                mapping[key] = unique
+
+        if old.id is not None:
+            self.deleted_ids.add(old.id)
         self.add_customer(new)
         self.add_leads(new)
 
 
-def lead_action(lead: Lead, index: AbstractCustomerIndex, ids_map):
+def lead_action(lead: Lead, index: AbstractCustomerIndex, ids_map: Dict):
     abstract_customer = index.lead_ids.get(lead.id)
-    lead_login = lead.get_field('Логин')
-    if lead_login:
-        abs_customer_login = index._unique(index.customer_logins, lead_login)
-        if abstract_customer is None:
-            abstract_customer = abs_customer_login
-        elif abs_customer_login is not None and abs_customer_login.id != abstract_customer.id:
-            abstract_customer.amo_customers = dict_compare_merge(abstract_customer.amo_customers or [],
-                                                                 abs_customer_login.amo_customers or [])
-            abstract_customer.amo_leads = dict_compare_merge(abstract_customer.amo_leads or [],
-                                                             abs_customer_login.amo_leads or [])
-            abstract_customer.amo_contacts = dict_compare_merge(abstract_customer.amo_contacts or [],
-                                                                abs_customer_login.amo_contacts or [])
-            abstract_customer.amo_companies = dict_compare_merge(abstract_customer.amo_companies or [],
-                                                                 abs_customer_login.amo_companies or [])
-            for attr in ('amo_customers', 'amo_leads', 'amo_contacts', 'amo_companies'):
-                flag_modified(abstract_customer, attr)
-            db.session.delete(abs_customer_login)
-            if abs_customer_login.id in ids_map:
-                merged_ids = ids_map.pop(abs_customer_login.id)
-                target_ids = ids_map.setdefault(abstract_customer.id, {
-                    "customers": [], "leads": [], "contacts": [], "companies": []
-                })
-                for key in target_ids:
-                    target_ids[key].extend(merged_ids.get(key, []))
-            index.replace(abs_customer_login, abstract_customer)
-            abstract_customer = create_or_update_lead(abstract_customer, lead)
-            index.add_leads(abstract_customer, lead)
-            return abstract_customer
+    customer_by_login = index._unique(index.customer_logins, lead.get_field('Логин'))
+
+    if abstract_customer is None:
+        abstract_customer = customer_by_login
+    elif customer_by_login is not None and customer_by_login is not abstract_customer:
+        if abstract_customer.id is None or customer_by_login.id is None:
+            db.session.flush()
+
+        abstract_customer.amo_customers = dict_compare_merge(
+            abstract_customer.amo_customers or [], customer_by_login.amo_customers or [])
+        abstract_customer.amo_leads = dict_compare_merge(
+            abstract_customer.amo_leads or [], customer_by_login.amo_leads or [])
+        abstract_customer.amo_contacts = dict_compare_merge(
+            abstract_customer.amo_contacts or [], customer_by_login.amo_contacts or [])
+        abstract_customer.amo_companies = dict_compare_merge(
+            abstract_customer.amo_companies or [], customer_by_login.amo_companies or [])
+
+        for attr in ('amo_customers', 'amo_leads', 'amo_contacts', 'amo_companies'):
+            flag_modified(abstract_customer, attr)
+
+        db.session.delete(customer_by_login)
+        old_id = customer_by_login.id
+        if old_id in ids_map:
+            old_ids = ids_map.pop(old_id)
+            target_ids = ids_map.setdefault(abstract_customer.id, {
+                'customers': [], 'leads': [], 'contacts': [], 'companies': []
+            })
+            for key in target_ids:
+                target_ids[key].extend(old_ids.get(key, []))
+
+        index.replace(customer_by_login, abstract_customer)
+
+    if abstract_customer is not None:
+        index.remove_lead(lead.id)
 
     abstract_customer = create_or_update_lead(abstract_customer, lead)
     index.add_leads(abstract_customer, lead)
     return abstract_customer
 
 
-def collect_leads_customers(is_full=True):
-    """
-     Берем всех покупателей, если его нет в бд - делаем новую запись AbstractCutomer, в него кладем.
-     Есть есть - находим его запись по id и перезаписываем
-
-     Вот так у нас коллектятся все кастомеры
-
-     Далее берутся все лиды. Ищутся их записи в бд по id, если не находится и есть логин
-     - находим его запись по кастомеру с тем же логином, кладем к нему.
-     Если нет логина/нет кастомера - пропускаем. Если нашелся - перезаписываем соответственно
-         abstract_id_customer : {
-        customers: [...],
-        leads: [...],
-        contacts: [...],
-        companies: [...]
-    }
-    """
+def _collect_leads_customers(is_full=True):
     session = db.session
-    customers: Iterator[Customer] = amocrm_get(Customer, _with=f"{COMPANIES},{CONTACTS}")
-    logger.info(f"Collected customers {is_full=}")
-
     abstract_customers = session.query(AbstractCustomer).all()
     customer_index = AbstractCustomerIndex(abstract_customers)
     ids_map = {}
+    pending_customers = []
+    pending_leads = []
+
+    def get_ids(abstract_customer):
+        return ids_map.setdefault(abstract_customer.id, {
+            'customers': [], 'leads': [], 'contacts': [], 'companies': []
+        })
+
+    def save_customer_ids(items):
+        for abstract_customer, customer in items:
+            entity_ids = get_ids(abstract_customer)
+            entity_ids['customers'].append(customer.id)
+            entity_ids['contacts'].extend(item['id'] for item in customer.contacts)
+            entity_ids['companies'].extend(item['id'] for item in customer.companies)
+
+    def save_lead_ids(items):
+        for abstract_customer, lead in items:
+            entity_ids = get_ids(abstract_customer)
+            entity_ids['leads'].append(lead.id)
+            entity_ids['contacts'].extend(item['id'] for item in lead.contacts)
+            entity_ids['companies'].extend(item['id'] for item in lead.companies)
+
+    customers: Iterator[Customer] = amocrm_get(Customer, _with=f'{COMPANIES},{CONTACTS}')
+    logger.info('Collected customers is_full=%s', is_full)
+
     for customer in customers:
-        if is_full is False and customer.status_id == 111349:
+        if not is_full and customer.status_id == 111349:
             continue
+
         customer_login = customer.get_field('Логин')
         if not customer_login:
             continue
+
         abstract_customer = customer_index.customer_ids.get(customer.id)
         if abstract_customer is None:
             abstract_customer = customer_index._unique(customer_index.lead_logins, customer_login)
+
+        customer_index.remove_customer(customer.id)
         abstract_customer = create_or_update_customer(abstract_customer, customer)
-        if abstract_customer.id is None:
-            session.flush()
         customer_index.add_customer(abstract_customer, customer)
-        if is_full is True:
-            if abstract_customer.id in ids_map:
-                ids_map[abstract_customer.id]["customers"].append(customer.id)
-                ids_map[abstract_customer.id]["contacts"].extend([c["id"] for c in customer.contacts])
-                ids_map[abstract_customer.id]["companies"].extend([c["id"] for c in customer.companies])
-            else:
-                ids_map[abstract_customer.id] = {
-                    "customers": [customer.id],
-                    "contacts": [c["id"] for c in customer.contacts],
-                    "companies": [c["id"] for c in customer.companies],
-                    "leads": [],
-                }
+        pending_customers.append((abstract_customer, customer))
+
+        if len(pending_customers) >= 500:
+            session.flush()
+            if is_full:
+                save_customer_ids(pending_customers)
+            pending_customers.clear()
+
+    if pending_customers:
+        session.flush()
+        if is_full:
+            save_customer_ids(pending_customers)
+        pending_customers.clear()
 
     del customers
-    amo_leads: Iterator[Lead] = amocrm_get(Lead, _with=f"{CONTACTS}")
-    logger.info(f"Collected leads {is_full=}")
-    for amo_lead in amo_leads:
-        if is_full is False and amo_lead.status_id == 143:
-            continue
-        abc_customer = lead_action(amo_lead, customer_index, ids_map)
-        if abc_customer.id is None:
-            session.flush()
-        if is_full is True:
-            if abc_customer.id in ids_map:
-                ids_map[abc_customer.id]["leads"].append(amo_lead.id)
-                ids_map[abc_customer.id]["contacts"].extend([c["id"] for c in amo_lead.contacts])
-            else:
-                ids_map[abc_customer.id] = {
-                    "customers": [],
-                    "contacts": [c["id"] for c in amo_lead.contacts],
-                    "companies": [],
-                    "leads": [amo_lead.id],
-                }
 
-    if is_full is False:
+    amo_leads: Iterator[Lead] = amocrm_get(Lead, _with=CONTACTS)
+    logger.info('Collected leads is_full=%s', is_full)
+
+    for amo_lead in amo_leads:
+        if not is_full and amo_lead.status_id == 143:
+            continue
+
+        abstract_customer = lead_action(amo_lead, customer_index, ids_map)
+        pending_leads.append((abstract_customer, amo_lead))
+
+        if len(pending_leads) >= 500:
+            session.flush()
+            if is_full:
+                save_lead_ids(pending_leads)
+            pending_leads.clear()
+
+    if pending_leads:
+        session.flush()
+        if is_full:
+            save_lead_ids(pending_leads)
+        pending_leads.clear()
+
+    if not is_full:
         session.commit()
         return
+
     try:
-        logger.info("Чистка покупателей общая")
-        logger.info("Чистка покупателей на уровне сущностей")
-        for abc_customer in abstract_customers:
-            if abc_customer.id in customer_index.deleted_ids:
+        logger.info('Чистка покупателей общая')
+        for abstract_customer in customer_index.customers:
+            if abstract_customer.id in customer_index.deleted_ids:
                 continue
-            if abc_customer.id not in ids_map:
-                session.delete(abc_customer)
+            if abstract_customer.id not in ids_map:
+                session.delete(abstract_customer)
                 continue
-            filter_abc_customer(abc_customer=abc_customer, ids_map=ids_map)
+            filter_abc_customer(abstract_customer, ids_map)
         session.commit()
     except Exception:
         session.rollback()
         raise
 
 
+def collect_leads_customers(is_full=True):
+    try:
+        _collect_leads_customers(is_full=is_full)
+    except Exception:
+        db.session.rollback()
+        logger.exception('CRM synchronization failed')
+        raise
+
+
 def filter_merge_abstract_customer(abc_customer: AbstractCustomer, attr: str,
                                    check_ids: List[int]):
-    entity = abc_customer.__getattribute__(attr)
-    entity = [item for item in entity if
-              'удалить' not in (item['general'].get('name') or '').lower()
-              and item['general'].get('id') in check_ids]
-    setattr(abc_customer, attr, entity)
-    flag_modified(abc_customer, attr)
+    entities = getattr(abc_customer, attr) or []
+    filtered = [item for item in entities
+                if 'удалить' not in ((item.get('general') or {}).get('name') or '').lower()
+                and (item.get('general') or {}).get('id') in check_ids]
+    setattr(abc_customer, attr, filtered)
 
 
 def filter_abc_customer(abc_customer: AbstractCustomer, ids_map: Dict):
-    if abc_customer.amo_leads:
-        filter_merge_abstract_customer(abc_customer=abc_customer,
-                                       attr="amo_leads",
-                                       check_ids=ids_map.get(abc_customer.id, {}).get("leads", []))
-    if abc_customer.amo_customers:
-        filter_merge_abstract_customer(abc_customer=abc_customer,
-                                       attr="amo_customers",
-                                       check_ids=ids_map.get(abc_customer.id, {}).get("customers", []))
-    if abc_customer.amo_contacts:
-        filter_merge_abstract_customer(abc_customer=abc_customer,
-                                       attr="amo_contacts",
-                                       check_ids=ids_map.get(abc_customer.id, {}).get("contacts", []))
-    if abc_customer.amo_companies:
-        filter_merge_abstract_customer(abc_customer=abc_customer,
-                                       attr="amo_companies",
-                                       check_ids=ids_map.get(abc_customer.id, {}).get("companies", []))
+    entity_ids = ids_map.get(abc_customer.id, {})
+    for attr, key in (
+        ('amo_leads', 'leads'),
+        ('amo_customers', 'customers'),
+        ('amo_contacts', 'contacts'),
+        ('amo_companies', 'companies'),
+    ):
+        if getattr(abc_customer, attr):
+            filter_merge_abstract_customer(abc_customer, attr, entity_ids.get(key, []))
+
     if not abc_customer.amo_leads and not abc_customer.amo_customers:
         db.session.delete(abc_customer)

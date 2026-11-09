@@ -47,8 +47,8 @@ def get_customer_json(customer: Customer) -> dict:
             'id': customer.id,
             'login': customer.custom_fields_values.get('Логин', {}).get('value'),
             'billing_type': customer.custom_fields_values.get('Вид оплаты', {}).get('value'),
-            'is_robot': bool(customer.custom_fields_values.get('Робот')),
-            'is_nds': bool(customer.custom_fields_values.get('Оплата с НДС')),
+            'is_robot': bool(customer.custom_fields_values.get('Робот', {}).get('value')),
+            'is_nds': bool(customer.custom_fields_values.get('Оплата с НДС', {}).get('value')),
             'system': customer.custom_fields_values.get('Система', {}).get('value'),
             'host': customer.custom_fields_values.get('Хост', {}).get('value'),
             'name': customer.name,
@@ -125,7 +125,6 @@ def create_or_update_lead(abc_customer: Optional[AbstractCustomer], amo_lead: Le
         new_abstract_customer = AbstractCustomer(
             amo_leads=[get_lead_json(amo_lead)])
         db.session.add(new_abstract_customer)
-        db.session.flush()
         return new_abstract_customer
 
     if not abc_customer.amo_leads:

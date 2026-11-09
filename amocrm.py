@@ -1,3 +1,5 @@
+import inspect
+import os
 import time
 from typing import Type, Any, Iterator
 
@@ -59,6 +61,21 @@ class AmoCrmCompaniesMoreThanOne(Exception):
     """
 
 
+class EntitySchema:
+    def __init__(self, entity_class):
+        self.entity_class = entity_class
+        self.fields = set(inspect.signature(entity_class.__init__).parameters) - {'self'}
+
+    def load(self, values):
+        entities = []
+        for value in values:
+            data = {key: item for key, item in value.items() if key in self.fields}
+            entity = self.entity_class(**data)
+            entity._raw_data = value
+            entities.append(entity)
+        return entities
+
+
 class BaseEntity:
     """
     base class for entity
@@ -69,6 +86,36 @@ class BaseEntity:
     custom_fields_values = None
     PATCH_FIELDS = None
 
+    @classmethod
+    def get_schema(cls, many=False):
+        return EntitySchema(cls)
+
+    def as_dict(self):
+        raw_data = getattr(self, '_raw_data', None)
+        if raw_data is not None:
+            return raw_data
+        return {key: value for key, value in self.__dict__.items()
+                if not key.startswith('_')}
+
+    @staticmethod
+    def _normalize_custom_fields(values):
+        if not values:
+            return {}
+        if isinstance(values, dict):
+            return values
+
+        result = {}
+        for field in values:
+            name = field.get('field_name') or field.get('field_code')
+            if not name:
+                continue
+            field_values = field.get('values') or []
+            result[name] = {
+                'id': field.get('field_id'),
+                'value': field_values[0].get('value') if field_values else None,
+            }
+        return result
+
     def __str__(self):
         return f"<{type(self).__name__}: {self.name}, {self.id}>"
 
@@ -76,7 +123,7 @@ class BaseEntity:
         return str(self)
 
     def get_field(self, field_name):
-        return self.custom_fields_values.get(field_name, {}).get('value')
+        return (self.custom_fields_values or {}).get(field_name, {}).get('value')
 
     def set_field(self, field_name, field_value, field_id=None):
         custom_field = self.custom_fields_values.get(field_name)
@@ -105,24 +152,24 @@ class Customer(BaseEntity):
     entity_name = CUSTOMERS
 
     def __init__(self,
-                 id,
-                 name,
-                 next_price,
-                 next_date,
-                 responsible_user_id,
-                 status_id,
-                 periodicity,
-                 created_by,
-                 updated_by,
-                 created_at,
-                 updated_at,
-                 closest_task_at,
-                 is_deleted,
-                 ltv,
-                 purchases_count,
-                 average_check,
-                 account_id,
-                 custom_fields_values,
+                 id=None,
+                 name=None,
+                 next_price=None,
+                 next_date=None,
+                 responsible_user_id=None,
+                 status_id=None,
+                 periodicity=None,
+                 created_by=None,
+                 updated_by=None,
+                 created_at=None,
+                 updated_at=None,
+                 closest_task_at=None,
+                 is_deleted=None,
+                 ltv=None,
+                 purchases_count=None,
+                 average_check=None,
+                 account_id=None,
+                 custom_fields_values=None,
                  _embedded=None
                  ):
         self.id = id
@@ -142,7 +189,7 @@ class Customer(BaseEntity):
         self.purchases_count = purchases_count
         self.average_check = average_check
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = self._normalize_custom_fields(custom_fields_values)
         self._embedded = _embedded
 
         self.companies = []
@@ -200,13 +247,16 @@ class Lead(BaseEntity):
         self.is_deleted = is_deleted
         self.score = score
         self.account_id = account_id
-        self.custom_fields_values = custom_fields_values
+        self.custom_fields_values = self._normalize_custom_fields(custom_fields_values)
         self._embedded = _embedded
         self.tags = []
         self.contacts = []
         self.companies = []
         if not _embedded:
             return
+        self.tags = _embedded.get(TAGS) or []
+        self.contacts = _embedded.get(CONTACTS) or []
+        self.companies = _embedded.get(COMPANIES) or []
 
 
 def amocrm_get(obj_cls: Type[BaseEntity],
@@ -235,9 +285,13 @@ def amocrm_get(obj_cls: Type[BaseEntity],
     if query:
         params[f'query'] = query
 
-    headers = {}
-    base_url = ""
-    url = f"{base_url}{obj_cls.url}"
+    base_url = os.getenv('AMOCRM_BASE_URL')
+    access_token = os.getenv('AMOCRM_ACCESS_TOKEN')
+    if not base_url or not access_token:
+        raise RuntimeError('Set AMOCRM_BASE_URL and AMOCRM_ACCESS_TOKEN')
+
+    headers = {'Authorization': f'Bearer {access_token}'}
+    url = f"{base_url.rstrip('/')}/{obj_cls.url.lstrip('/')}"
     entity_name = obj_cls.entity_name
     schema = obj_cls.get_schema(many=True)
 
@@ -287,7 +341,10 @@ def amocrm_get(obj_cls: Type[BaseEntity],
                 break
             time.sleep(1)
             # reset url and params for page iteration
-            url = json_data['_links']['next']['href']
+            next_url = (json_data.get('_links') or {}).get('next', {}).get('href')
+            if not next_url:
+                break
+            url = next_url
             params = {}
 
 
